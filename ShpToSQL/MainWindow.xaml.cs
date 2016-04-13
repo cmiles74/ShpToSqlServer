@@ -12,6 +12,7 @@ using System.Data;
 using System.Data.Common;
 using System.Data.SqlClient;
 using System.Data.SqlTypes;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -34,6 +35,8 @@ namespace ShpToSQL
     {
         private SqlConnectionString _cString;
         private FeatureDataTable _table;
+        private Envelope importExtent;
+        private int problemRowNum;
 
         public MainWindow()
         {
@@ -103,16 +106,16 @@ namespace ShpToSQL
         public String LoadShapefile(String shapefile)
         {
             FeatureDataTable dt;
-
-            try
-            {
-                dt = GetFeatureTableFromShapefile(shapefile);
-            }
-            catch (Exception)
-            {
-                _status.Text = "Bad Shape file path";
-                return String.Empty;
-            }
+            dt = GetFeatureTableFromShapefile(shapefile);
+            //try
+            //{
+            //    dt = GetFeatureTableFromShapefile(shapefile);
+            //}
+            //catch (Exception)
+            //{
+            //    _status.Text = "Bad Shape file path";
+            //    return String.Empty;
+            //}
 
             _textBoxPanel.Children.Clear();
             foreach (DataColumn column in dt.Columns)
@@ -140,11 +143,64 @@ namespace ShpToSQL
             ShapeFile sf = new ShapeFile(shapeFilePath);
             sf.Encoding = Encoding.GetEncoding(int.Parse(_enconding.Text));
             sf.Open();
-            Envelope ext = sf.GetExtents();
+
             FeatureDataSet ds = new FeatureDataSet();
-            sf.ExecuteIntersectionQuery(ext, ds);
+            importExtent = sf.GetExtents();
+            Debug.WriteLine("Loading " + sf.GetFeatureCount() + " features from shapefile...");
+
+            //sf.ExecuteIntersectionQuery(importExtent, ds);
+            ExecuteRobustIntersectionQuery(sf, importExtent, ds);
             //ds.Tables[0].Columns.Remove("Oid");
             return ds.Tables[0];
+        }
+
+        public void ExecuteRobustIntersectionQuery(ShapeFile shapeFile, Envelope bbox, FeatureDataSet ds)
+        {
+            //Use the spatial index to get a list of features whose boundingbox intersects bbox
+            var objectlist = shapeFile.GetObjectIDsInView(bbox);
+
+            Stream stream = new FileStream(shapeFile.Filename, FileMode.Open, FileAccess.Read);
+            string dbfFile = Path.ChangeExtension(shapeFile.Filename, ".dbf");
+            string indexFile = Path.ChangeExtension(shapeFile.Filename, ".shx");
+
+            DbaseReader dbaseReader = null;
+            if(File.Exists(dbfFile))
+            {
+                dbaseReader = new DbaseReader(dbfFile);
+                dbaseReader.Open();
+            }
+            
+            using (BinaryReader br = new BinaryReader(stream))
+            {
+                using (DbaseReader dbaseFile = dbaseReader)
+                {
+                    var dt = dbaseFile.NewTable;
+                    dt.BeginLoadData();
+
+                    for (var i = 0; i < objectlist.Count; i++)
+                    {
+                        FeatureDataRow fdr;
+                        try
+                        {
+                            var geometry = shapeFile.GetFeature(objectlist[i]).Geometry;
+                            //fdr.Geometry = ReadGeometry(objectlist[i], br, dbaseFile);
+                            fdr = (FeatureDataRow)dt.LoadDataRow(dbaseFile.GetValues(objectlist[i]), true);
+                            fdr.Geometry = geometry;
+                        }
+                        catch (Exception)
+                        {
+                            Debug.WriteLine("ERROR: Bad geometry for feature at index " + objectlist[i]);
+                        }
+                    }
+
+                    dt.EndLoadData();
+                    dt.AcceptChanges();
+
+                    ds.Tables.Add(dt);
+                    dbaseFile.Close();
+                }
+                br.Close();
+            }
         }
 
         public String ImportFromShapefile(String shapeFilePath, String connectionString)
